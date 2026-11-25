@@ -1,0 +1,720 @@
+name: Compilar APK
+
+# ARCHIVO UNICO: aqui esta TODO el codigo de la app Salta Anuncios MC.
+# Para cambiar algo, reemplaza este archivo completo y dale Commit.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Crear proyecto
+        run: |
+          mkdir -p proyecto && cd proyecto
+          # ===== settings.gradle.kts =====
+          cat > settings.gradle.kts <<'FIN_ARCHIVO'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "SaltaAnuncios"
+          include(":app")
+          FIN_ARCHIVO
+
+          # ===== build.gradle.kts =====
+          cat > build.gradle.kts <<'FIN_ARCHIVO'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIN_ARCHIVO
+
+          # ===== gradle.properties =====
+          cat > gradle.properties <<'FIN_ARCHIVO'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          FIN_ARCHIVO
+
+          # ===== app/build.gradle.kts =====
+          mkdir -p app
+          cat > app/build.gradle.kts <<'FIN_ARCHIVO'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.mc.saltaanuncios"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.mc.saltaanuncios"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          FIN_ARCHIVO
+
+          # ===== app/src/main/AndroidManifest.xml =====
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Para que funcione en Android TV (Shield) y también en celular -->
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:banner="@drawable/banner"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.SaltaAnuncios">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".SaltaAnunciosService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+              </application>
+          </manifest>
+          FIN_ARCHIVO
+
+          # ===== app/src/main/java/com/mc/saltaanuncios/SaltaAnunciosService.kt =====
+          mkdir -p app/src/main/java/com/mc/saltaanuncios
+          cat > app/src/main/java/com/mc/saltaanuncios/SaltaAnunciosService.kt <<'FIN_ARCHIVO'
+          package com.mc.saltaanuncios
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.view.accessibility.AccessibilityWindowInfo
+
+          /**
+           * Servicio de accesibilidad que NO bloquea anuncios.
+           * El anuncio se muestra normal; en cuanto la app ofrece "Omitir anuncio",
+           * "Saltar", "Skip" o una X para cerrarlo, este servicio lo presiona por ti.
+           */
+          class SaltaAnunciosService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var escaneoPendiente = false
+              private var ultimoClic = 0L
+              private var reintentos = 0
+              private var ultimoDiagnostico = 0L
+              private var ultimaHuellaDiagnostico = 0
+
+              // Apps donde nunca hace nada: ajustes, launcher y esta misma app
+              private val excluidos = setOf(
+                  "com.mc.saltaanuncios",
+                  "com.android.tv.settings",
+                  "com.android.settings",
+                  "com.android.systemui",
+                  "com.google.android.tvlauncher",
+                  "com.google.android.apps.tv.launcherx",
+                  "com.google.android.leanbacklauncher"
+              )
+
+              // Botones que SIEMPRE son de anuncio
+              private val omitirSeguros = setOf(
+                  "omitir anuncio", "omitir anuncios", "omitir publicidad",
+                  "saltar anuncio", "saltar anuncios", "saltar publicidad",
+                  "skip ad", "skip ads", "skip advertisement"
+              )
+
+              // Botones cortos: solo cuentan si en pantalla hay señales de anuncio
+              private val omitirCortos = setOf("omitir", "saltar", "skip", "omitir ahora", "skip now")
+
+              // Botones de cerrar: solo si hay señales de anuncio
+              private val cerrar = setOf(
+                  "cerrar anuncio", "cerrar publicidad", "close ad",
+                  "cerrar", "close", "dismiss", "descartar"
+              )
+              private val simbolosX = setOf("x", "×", "✕", "✖", "╳", "⨉", "ⓧ", "⊗")
+
+              // Cosas que NO queremos saltar (intros, resúmenes, créditos)
+              private val palabrasProhibidas = listOf(
+                  "intro", "recap", "resumen", "credits", "créditos", "creditos", "episodio", "episode"
+              )
+
+              private val regexAnuncio = Regex("""\b(anuncios?|publicidad|patrocinado|sponsored|advertisement|ads?)\b""")
+              private val regexIdAnuncio = Regex("""(^|[/_.:])(ads?|advert[a-z]*)([_.]|$)""")
+              private val regexDigito = Regex("""\d""")
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  AdLog.agregar(this, "Servicio iniciado")
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  val pkg = event?.packageName?.toString() ?: return
+                  if (pkg in excluidos) return
+                  reintentos = 0
+                  programarEscaneo(150)
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  super.onDestroy()
+              }
+
+              private fun programarEscaneo(retrasoMs: Long) {
+                  if (escaneoPendiente) return
+                  escaneoPendiente = true
+                  handler.postDelayed({
+                      escaneoPendiente = false
+                      try {
+                          escanear()
+                      } catch (e: Exception) {
+                          AdLog.agregar(this, "Error: ${e.message}")
+                      }
+                  }, retrasoMs)
+              }
+
+              private fun escanear() {
+                  val raices = obtenerRaices()
+                  if (raices.isEmpty()) return
+
+                  val nodos = mutableListOf<AccessibilityNodeInfo>()
+                  for (r in raices) recolectar(r, nodos, 0)
+                  if (nodos.isEmpty()) return
+
+                  val pkg = raices.first().packageName?.toString() ?: "?"
+                  val hayAnuncio = nodos.any { it.isVisibleToUser && esSenalDeAnuncio(it) }
+
+                  if (Prefs.diagnostico(this)) diagnostico(pkg, nodos, hayAnuncio)
+
+                  // Buscar el mejor botón (prioridad menor = mejor)
+                  var elegido: AccessibilityNodeInfo? = null
+                  var etiqueta = ""
+                  var mejor = Int.MAX_VALUE
+                  for (n in nodos) {
+                      if (!n.isVisibleToUser || !n.isEnabled) continue
+                      val p = prioridad(n, hayAnuncio) ?: continue
+                      if (p.first < mejor) {
+                          mejor = p.first
+                          elegido = n
+                          etiqueta = p.second
+                      }
+                  }
+
+                  val nodo = elegido
+                  if (nodo == null) {
+                      // Hay anuncio pero el botón todavía no sale (cuenta regresiva): revisar otra vez
+                      if (hayAnuncio && reintentos++ < 40) programarEscaneo(800)
+                      return
+                  }
+
+                  val ahora = SystemClock.elapsedRealtime()
+                  if (ahora - ultimoClic < 1500) {
+                      programarEscaneo(800)
+                      return
+                  }
+                  ultimoClic = ahora
+
+                  val ok = clic(nodo)
+                  AdLog.agregar(this, (if (ok) "✔ Clic en '" else "✘ Falló clic en '") + etiqueta + "'  [" + pkg + "]")
+
+                  // Por si viene otro anuncio seguido
+                  programarEscaneo(1200)
+              }
+
+              /** Ventanas de apps normales (no sistema, no excluidas). */
+              private fun obtenerRaices(): List<AccessibilityNodeInfo> {
+                  val lista = mutableListOf<AccessibilityNodeInfo>()
+                  try {
+                      for (w in windows) {
+                          if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                          val r = w.root ?: continue
+                          if ((r.packageName?.toString() ?: "") in excluidos) continue
+                          lista.add(r)
+                      }
+                  } catch (e: Exception) {
+                  }
+                  if (lista.isEmpty()) {
+                      val r = rootInActiveWindow
+                      if (r != null && (r.packageName?.toString() ?: "") !in excluidos) lista.add(r)
+                  }
+                  return lista
+              }
+
+              private fun recolectar(n: AccessibilityNodeInfo, salida: MutableList<AccessibilityNodeInfo>, profundidad: Int) {
+                  if (salida.size > 2500 || profundidad > 60) return
+                  salida.add(n)
+                  for (i in 0 until n.childCount) {
+                      val hijo = n.getChild(i) ?: continue
+                      recolectar(hijo, salida, profundidad + 1)
+                  }
+              }
+
+              private fun textos(n: AccessibilityNodeInfo): List<String> =
+                  listOfNotNull(n.text, n.contentDescription)
+                      .map { normalizar(it.toString()) }
+                      .filter { it.isNotEmpty() }
+
+              private fun normalizar(s: String): String =
+                  s.lowercase().trim().trim('›', '>', '▶', '▸', '►', '⏭', '|', '»', ' ').trim()
+
+              private fun idCorto(n: AccessibilityNodeInfo): String =
+                  n.viewIdResourceName?.lowercase()?.substringAfter(":id/") ?: ""
+
+              private fun esSenalDeAnuncio(n: AccessibilityNodeInfo): Boolean {
+                  if (textos(n).any { regexAnuncio.containsMatchIn(it) }) return true
+                  val id = idCorto(n)
+                  return id.isNotEmpty() && regexIdAnuncio.containsMatchIn(id)
+              }
+
+              /** Regresa (prioridad, etiqueta) si el nodo es un botón para quitar el anuncio. */
+              private fun prioridad(n: AccessibilityNodeInfo, hayAnuncio: Boolean): Pair<Int, String>? {
+                  val ts = textos(n)
+                  val id = idCorto(n)
+
+                  // "Omitir en 5" = todavía no se puede; y nunca saltar intros/resúmenes
+                  if (ts.any { regexDigito.containsMatchIn(it) }) return null
+                  if ((ts + id).any { t -> palabrasProhibidas.any { it in t } }) return null
+
+                  for (t in ts) {
+                      if (t in omitirSeguros || t.startsWith("omitir anuncio") || t.startsWith("skip ad")) return 1 to t
+                      if (hayAnuncio && t in omitirCortos) return 2 to t
+                      if (hayAnuncio && (t in cerrar || t in simbolosX)) return 3 to t
+                  }
+
+                  if (hayAnuncio && id.isNotEmpty()) {
+                      if ("skip" in id || "omitir" in id) return 2 to "id:$id"
+                      val esCerrar = "close" in id || "cerrar" in id || "dismiss" in id
+                      if (esCerrar && regexIdAnuncio.containsMatchIn(id)) return 3 to "id:$id"
+                  }
+                  return null
+              }
+
+              private fun clic(nodo: AccessibilityNodeInfo): Boolean {
+                  // 1) El botón o su contenedor clicable
+                  var actual: AccessibilityNodeInfo? = nodo
+                  var nivel = 0
+                  while (actual != null && nivel < 6) {
+                      if (actual.isClickable && actual.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                      actual = actual.parent
+                      nivel++
+                  }
+                  // 2) Intentar clic directo aunque no diga que es clicable
+                  if (nodo.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+
+                  // 3) Plan B: "tocar" el centro del botón
+                  val r = Rect()
+                  nodo.getBoundsInScreen(r)
+                  if (r.isEmpty) return false
+                  val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
+                  val gesto = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+                      .build()
+                  return dispatchGesture(gesto, null, null)
+              }
+
+              /** Modo diagnóstico: guarda qué botones/textos ve en pantalla. */
+              private fun diagnostico(pkg: String, nodos: List<AccessibilityNodeInfo>, hayAnuncio: Boolean) {
+                  val ahora = SystemClock.elapsedRealtime()
+                  if (ahora - ultimoDiagnostico < 4000) return
+
+                  val lineas = mutableListOf<String>()
+                  for (n in nodos) {
+                      if (!n.isVisibleToUser) continue
+                      val txt = n.text?.toString()?.trim().orEmpty()
+                      val desc = n.contentDescription?.toString()?.trim().orEmpty()
+                      val id = idCorto(n)
+                      if (txt.isEmpty() && desc.isEmpty() && id.isEmpty()) continue
+                      val clic = if (n.isClickable) " [clic]" else ""
+                      lineas.add("   · t='${txt.take(40)}' d='${desc.take(40)}' id=$id$clic")
+                      if (lineas.size >= 60) break
+                  }
+
+                  val huella = lineas.hashCode()
+                  if (huella == ultimaHuellaDiagnostico) return
+                  ultimaHuellaDiagnostico = huella
+                  ultimoDiagnostico = ahora
+
+                  AdLog.agregar(
+                      this,
+                      "── Pantalla de $pkg (anuncio=${if (hayAnuncio) "SÍ" else "no"}) ──\n" + lineas.joinToString("\n")
+                  )
+              }
+          }
+          FIN_ARCHIVO
+
+          # ===== app/src/main/java/com/mc/saltaanuncios/Utilidades.kt =====
+          mkdir -p app/src/main/java/com/mc/saltaanuncios
+          cat > app/src/main/java/com/mc/saltaanuncios/Utilidades.kt <<'FIN_ARCHIVO'
+          package com.mc.saltaanuncios
+
+          import android.content.Context
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object Prefs {
+              private const val ARCHIVO = "ajustes"
+
+              fun diagnostico(c: Context): Boolean =
+                  c.getSharedPreferences(ARCHIVO, Context.MODE_PRIVATE).getBoolean("diagnostico", false)
+
+              fun setDiagnostico(c: Context, valor: Boolean) {
+                  c.getSharedPreferences(ARCHIVO, Context.MODE_PRIVATE).edit().putBoolean("diagnostico", valor).apply()
+              }
+          }
+
+          /** Registro sencillo en un archivo (se ve dentro de la app, sin PC). */
+          object AdLog {
+              private const val ARCHIVO = "registro.txt"
+              private const val MAX_LINEAS = 400
+              private val formato = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+              @Synchronized
+              fun agregar(c: Context, mensaje: String) {
+                  try {
+                      val f = File(c.filesDir, ARCHIVO)
+                      val lineas = if (f.exists()) f.readLines().toMutableList() else mutableListOf()
+                      val hora = formato.format(Date())
+                      mensaje.lines().forEachIndexed { i, l -> lineas.add(if (i == 0) "$hora  $l" else l) }
+                      val recorte = if (lineas.size > MAX_LINEAS) lineas.takeLast(MAX_LINEAS) else lineas
+                      f.writeText(recorte.joinToString("\n"))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun leer(c: Context): String {
+                  val f = File(c.filesDir, ARCHIVO)
+                  return if (f.exists()) f.readText() else ""
+              }
+
+              fun borrar(c: Context) {
+                  File(c.filesDir, ARCHIVO).delete()
+              }
+          }
+          FIN_ARCHIVO
+
+          # ===== app/src/main/java/com/mc/saltaanuncios/MainActivity.kt =====
+          mkdir -p app/src/main/java/com/mc/saltaanuncios
+          cat > app/src/main/java/com/mc/saltaanuncios/MainActivity.kt <<'FIN_ARCHIVO'
+          package com.mc.saltaanuncios
+
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.Button
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var txtEstado: TextView
+              private lateinit var txtRegistro: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var btnDiag: Button
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  txtEstado = findViewById(R.id.txtEstado)
+                  txtRegistro = findViewById(R.id.txtRegistro)
+                  scroll = findViewById(R.id.scrollRegistro)
+                  btnDiag = findViewById(R.id.btnDiagnostico)
+
+                  findViewById<Button>(R.id.btnAccesibilidad).setOnClickListener {
+                      try {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      } catch (e: Exception) {
+                          Toast.makeText(
+                              this,
+                              "Ábrelo en Ajustes > Preferencias del dispositivo > Accesibilidad",
+                              Toast.LENGTH_LONG
+                          ).show()
+                      }
+                  }
+
+                  btnDiag.setOnClickListener {
+                      Prefs.setDiagnostico(this, !Prefs.diagnostico(this))
+                      actualizar()
+                  }
+
+                  findViewById<Button>(R.id.btnActualizar).setOnClickListener { actualizar() }
+
+                  findViewById<Button>(R.id.btnBorrar).setOnClickListener {
+                      AdLog.borrar(this)
+                      actualizar()
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  actualizar()
+              }
+
+              private fun actualizar() {
+                  txtEstado.text = if (servicioActivo())
+                      "✅ Servicio ACTIVO: ya está saltando anuncios"
+                  else
+                      "❌ Servicio APAGADO: actívalo en Accesibilidad"
+
+                  btnDiag.text = if (Prefs.diagnostico(this))
+                      "Diagnóstico: ENCENDIDO"
+                  else
+                      "Diagnóstico: APAGADO"
+
+                  txtRegistro.text = AdLog.leer(this).ifBlank { "(Sin registros todavía)" }
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private fun servicioActivo(): Boolean {
+                  val habilitados = Settings.Secure.getString(
+                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  val cn = ComponentName(this, SaltaAnunciosService::class.java)
+                  val nombres = setOf(cn.flattenToString(), cn.flattenToShortString())
+                  return habilitados.split(':').any { s -> nombres.any { it.equals(s, ignoreCase = true) } }
+              }
+          }
+          FIN_ARCHIVO
+
+          # ===== app/src/main/res/layout/activity_main.xml =====
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="#121212"
+              android:orientation="vertical"
+              android:padding="32dp">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="@string/app_name"
+                  android:textColor="#FFFFFF"
+                  android:textSize="28sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:id="@+id/txtEstado"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:textColor="#DDDDDD"
+                  android:textSize="18sp" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="16dp"
+                  android:orientation="horizontal">
+
+                  <Button
+                      android:id="@+id/btnAccesibilidad"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Activar en Accesibilidad" />
+
+                  <Button
+                      android:id="@+id/btnDiagnostico"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="12dp"
+                      android:text="Diagnóstico" />
+
+                  <Button
+                      android:id="@+id/btnActualizar"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="12dp"
+                      android:text="Actualizar registro" />
+
+                  <Button
+                      android:id="@+id/btnBorrar"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="12dp"
+                      android:text="Borrar registro" />
+              </LinearLayout>
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="16dp"
+                  android:text="Registro (lo más nuevo abajo):"
+                  android:textColor="#AAAAAA" />
+
+              <ScrollView
+                  android:id="@+id/scrollRegistro"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="8dp"
+                  android:layout_weight="1"
+                  android:background="#1E1E1E"
+                  android:focusable="true"
+                  android:padding="12dp">
+
+                  <TextView
+                      android:id="@+id/txtRegistro"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:fontFamily="monospace"
+                      android:textColor="#E0E0E0"
+                      android:textSize="13sp" />
+              </ScrollView>
+
+          </LinearLayout>
+          FIN_ARCHIVO
+
+          # ===== app/src/main/res/values/strings.xml =====
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'FIN_ARCHIVO'
+          <resources>
+              <string name="app_name">Salta Anuncios MC</string>
+              <string name="descripcion_servicio">Presiona automáticamente Omitir anuncio, Saltar, Skip o la X de cerrar cuando la app ya lo permite. No bloquea anuncios: solo hace el clic por ti.</string>
+          </resources>
+          FIN_ARCHIVO
+
+          # ===== app/src/main/res/values/themes.xml =====
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'FIN_ARCHIVO'
+          <resources>
+              <style name="Theme.SaltaAnuncios" parent="Theme.AppCompat.DayNight.NoActionBar" />
+          </resources>
+          FIN_ARCHIVO
+
+          # ===== app/src/main/res/xml/accessibility_config.xml =====
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeWindowsChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="200"
+              android:description="@string/descripcion_servicio" />
+          FIN_ARCHIVO
+
+          # ===== app/src/main/res/drawable/banner.xml =====
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/banner.xml <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- Banner para el menú de apps de Android TV -->
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#C62828" />
+              <size android:width="320dp" android:height="180dp" />
+          </shape>
+          FIN_ARCHIVO
+
+          # ===== app/src/main/res/drawable/ic_launcher.xml =====
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- Icono: círculo rojo con flecha de "saltar" -->
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+              <path
+                  android:fillColor="#C62828"
+                  android:pathData="M24,2a22,22 0,1 0,0.01 0z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M14,14 L26,24 L14,34 Z M26,14 L36,24 L26,34 Z" />
+          </vector>
+          FIN_ARCHIVO
+
+          echo "Proyecto creado:" && find . -type f | sort
+
+      - name: Compilar APK
+        working-directory: proyecto
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Subir APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SaltaAnuncios-apk
+          path: proyecto/app/build/outputs/apk/debug/*.apk
